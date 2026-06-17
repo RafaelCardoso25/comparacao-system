@@ -312,30 +312,20 @@ export function exportSingleCotacaoPDF(result, cotacoes, cotacaoIdx, companyName
   doc.setFontSize(10);
   doc.text(`Gerado em: ${new Date().toLocaleString('pt-BR')}`, 14, 22);
 
-  // ── Itens onde este fornecedor é o mais barato (produtos comparados) ───────
-  const cheapestRows = [];
-  let totalCheapest = 0;
+  // ── Monta todas as linhas juntas ───────────────────────────────────────────
+  const allRows = [];
+  let grandTotal = 0;
 
   common.forEach(item => {
     const entry = safeArray(item?.entries).find(e => e?.cotacaoIdx === cotacaoIdx);
-    // FIX: só inclui se for o mais barato
     if (!entry || !entry.isCheapest) return;
 
     const price = toNumber(entry.price) || 0;
     const qty   = toNumber(entry.qty)   || 1;
 
-    cheapestRows.push([
-      safeString(item?.item),
-      String(qty),
-      formatCurrency(price),
-    ]);
-
-    totalCheapest += price;
+    allRows.push([safeString(item?.item), String(qty), formatCurrency(price)]);
+    grandTotal += price;
   });
-
-  // ── Itens exclusivos deste fornecedor ──────────────────────────────────────
-  const exclusiveRows = [];
-  let totalExclusive = 0;
 
   exclusive
     .filter(item => item?.cotacaoIdx === cotacaoIdx)
@@ -343,33 +333,21 @@ export function exportSingleCotacaoPDF(result, cotacoes, cotacaoIdx, companyName
       const price = toNumber(item.price) || 0;
       const qty   = toNumber(item.qty)   || 1;
 
-      exclusiveRows.push([
-        safeString(item?.item),
-        String(qty),
-        formatCurrency(price),
-      ]);
-
-      totalExclusive += price;
+      allRows.push([safeString(item?.item), String(qty), formatCurrency(price)]);
+      grandTotal += price;
     });
 
-  const grandTotal = totalCheapest + totalExclusive;
-
-  // ── Tabela: itens mais baratos ─────────────────────────────────────────────
-  if (cheapestRows.length > 0) {
-    doc.setFontSize(11);
-    doc.setFont(undefined, 'bold');
-    doc.text('Itens mais baratos neste fornecedor', 14, 30);
-    doc.setFont(undefined, 'normal');
-
+  // ── Tabela única ───────────────────────────────────────────────────────────
+  if (allRows.length > 0) {
     autoTable(doc, {
-      startY: 34,
+      startY: 30,
       head: [['Produto', 'Qtd', 'Preço Total']],
-      body: cheapestRows,
+      body: allRows,
       foot: [[
-        { content: 'Subtotal', colSpan: 2, styles: { fontStyle: 'bold' } },
-        { content: formatCurrency(totalCheapest), styles: { fontStyle: 'bold' } }
+        { content: 'TOTAL GERAL', colSpan: 2, styles: { fontStyle: 'bold' } },
+        { content: formatCurrency(grandTotal), styles: { fontStyle: 'bold' } }
       ]],
-      footStyles: { fillColor: [240, 240, 240], textColor: [0, 0, 0] },
+      footStyles: { fillColor: [220, 220, 220], textColor: [0, 0, 0] },
       styles: { fontSize: 9, cellPadding: 2 },
       columnStyles: {
         0: { cellWidth: 'auto' },
@@ -377,52 +355,9 @@ export function exportSingleCotacaoPDF(result, cotacoes, cotacaoIdx, companyName
         2: { cellWidth: 35, halign: 'right' }
       }
     });
-  }
-
-  // ── Tabela: itens exclusivos ───────────────────────────────────────────────
-  if (exclusiveRows.length > 0) {
-    const nextY = (doc.lastAutoTable?.finalY || 34) + 10;
-
-    doc.setFontSize(11);
-    doc.setFont(undefined, 'bold');
-    doc.text('Itens exclusivos neste fornecedor', 14, nextY);
-    doc.setFont(undefined, 'normal');
-
-    autoTable(doc, {
-      startY: nextY + 4,
-      head: [['Produto', 'Qtd', 'Preço Total']],
-      body: exclusiveRows,
-      foot: [[
-        { content: 'Subtotal', colSpan: 2, styles: { fontStyle: 'bold' } },
-        { content: formatCurrency(totalExclusive), styles: { fontStyle: 'bold' } }
-      ]],
-      footStyles: { fillColor: [240, 240, 240], textColor: [0, 0, 0] },
-      styles: { fontSize: 9, cellPadding: 2 },
-      columnStyles: {
-        0: { cellWidth: 'auto' },
-        1: { cellWidth: 20, halign: 'center' },
-        2: { cellWidth: 35, halign: 'right' }
-      }
-    });
-  }
-
-  // ── Total geral ────────────────────────────────────────────────────────────
-  if (cheapestRows.length > 0 || exclusiveRows.length > 0) {
-    const finalY = (doc.lastAutoTable?.finalY || 34) + 8;
-
-    doc.setFontSize(12);
-    doc.setFont(undefined, 'bold');
-    doc.text('TOTAL GERAL:', 14, finalY);
-    doc.text(formatCurrency(grandTotal), 195, finalY, { align: 'right' });
-    doc.setFont(undefined, 'normal');
   } else {
-    // Fornecedor não é o mais barato em nenhum item
-    const finalY = (doc.lastAutoTable?.finalY || 34) + 8;
     doc.setFontSize(11);
-    doc.text(
-      'Este fornecedor não é o mais barato em nenhum item comparado.',
-      14, finalY
-    );
+    doc.text('Nenhum item encontrado para este fornecedor.', 14, 35);
   }
 
   doc.save(buildFileName(`pedido_${cotacaoName.replace(/\s+/g, '_')}`, 'pdf'));
