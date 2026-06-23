@@ -25,7 +25,7 @@ export default function App() {
 
   async function fetchHistory() {
     try {
-      const res = await fetch('/api/history');
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/history`);
       const data = await res.json();
       if (data.success) setHistory(data.history ?? []);
     } catch {
@@ -35,7 +35,7 @@ export default function App() {
 
   async function saveToHistory(cotacoesData, rows, result) {
     try {
-      await fetch('/api/history', {
+      await fetch(`${import.meta.env.VITE_API_URL}/api/history`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -54,7 +54,7 @@ export default function App() {
 
   async function handleDeleteHistory(id) {
     try {
-      await fetch(`/api/history/${id}`, { method: 'DELETE' });
+      await fetch(`${import.meta.env.VITE_API_URL}/api/history/${id}`, { method: 'DELETE' });
     } catch {
       /* ignora */
     }
@@ -63,7 +63,7 @@ export default function App() {
 
   async function handleClearAll() {
     try {
-      await fetch('/api/history', { method: 'DELETE' });
+      await fetch(`${import.meta.env.VITE_API_URL}/api/history`, { method: 'DELETE' });
     } catch {
       /* ignora */
     }
