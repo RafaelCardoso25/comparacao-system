@@ -99,7 +99,7 @@ export default function UploadPhase({ onExtracted }) {
         });
       }, 4000);
 
-      const res = await fetch('/api/extract-pdfs', {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/extract-pdfs`, {
         method: 'POST',
         body: formData
       });
