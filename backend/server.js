@@ -3,7 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import pdf from 'pdf-parse/lib/pdf-parse.js';
 import Groq from 'groq-sdk';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import Anthropic from '@anthropic-ai/sdk';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
@@ -26,17 +26,22 @@ const upload = multer({
   }
 });
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// Groq principal (chave 1) e fallback (chave 2 gratuita)
+const groqPrimary = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const groqFallback = process.env.GROQ_API_KEY_2
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY_2 })
+  : null;
 const MODEL = 'llama-3.3-70b-versatile';
 import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const HISTORY_FILE = path.join(__dirname, 'history.json');
 
-const geminiClient = process.env.GEMINI_API_KEY
-  ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+// Claude (Anthropic) como fallback final quando as duas chaves Groq falharem
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null;
-const GEMINI_MODEL = 'gemini-2.0-flash';
+const CLAUDE_MODEL = 'claude-sonnet-4-6';
 
 const STRONG_COMMERCIAL_TOKENS = [
   'BIOPLIC','CLEANJOY','Z350','SINGLE','BOND','SOFLEX','HYDROGUM',
@@ -149,19 +154,23 @@ function isGroqServer(err) {
   return msg.includes('503') || msg.includes('fetch failed') || msg.includes('ECONNRESET');
 }
 
-async function callGemini(systemPrompt, userPrompt) {
-  if (!geminiClient) throw new Error('Gemini não configurado');
-  const model = geminiClient.getGenerativeModel({ model: GEMINI_MODEL });
-  const result = await model.generateContent(`${systemPrompt}\n\n${userPrompt}`);
-  const raw = result?.response?.text?.()?.trim();
-  if (!raw) throw new Error('Resposta vazia do Gemini');
+async function callClaude(systemPrompt, userPrompt) {
+  if (!anthropic) throw new Error('Claude não configurado');
+  const response = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 4000,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userPrompt }]
+  });
+  const raw = response?.content?.find(b => b.type === 'text')?.text?.trim();
+  if (!raw) throw new Error('Resposta vazia do Claude');
   return parseAIResponse(raw);
 }
 
-async function callGroq(systemPrompt, userPrompt, retries = 3) {
+async function callGroqWithClient(client, label, systemPrompt, userPrompt, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const response = await groq.chat.completions.create({
+      const response = await client.chat.completions.create({
         model: MODEL,
         messages: [
           { role: 'system', content: systemPrompt },
@@ -171,11 +180,11 @@ async function callGroq(systemPrompt, userPrompt, retries = 3) {
         max_tokens: 4000
       });
       const raw = response?.choices?.[0]?.message?.content?.trim();
-      if (!raw) throw new Error('Resposta vazia do Groq');
+      if (!raw) throw new Error(`Resposta vazia do ${label}`);
       return parseAIResponse(raw);
     } catch (err) {
       const msg = err?.message || String(err || '');
-      console.error(`[Groq] Erro tentativa ${attempt}:`, msg);
+      console.error(`[${label}] Erro tentativa ${attempt}:`, msg);
       if (msg.includes('tokens per day') || msg.includes('rate_limit_exceeded')) throw err;
       if ((isGroqRateLimit(err) || isGroqServer(err)) && attempt < retries) {
         await sleep(attempt * 8000); continue;
@@ -185,61 +194,35 @@ async function callGroq(systemPrompt, userPrompt, retries = 3) {
   }
 }
 
-async function callOpenRouter(systemPrompt, userPrompt) {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) throw new Error('OpenRouter não configurado');
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'meta-llama/llama-3.2-3b-instruct:free',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ],
-      temperature: 0.05,
-      max_tokens: 4000
-    })
-  });
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`OpenRouter erro ${response.status}: ${err}`);
-  }
-  const data = await response.json();
-  const raw = data?.choices?.[0]?.message?.content?.trim();
-  if (!raw) throw new Error('Resposta vazia do OpenRouter');
-  return parseAIResponse(raw);
-}
-
+// Cadeia de fallback: Groq chave 1 → Groq chave 2 → Claude
 async function callAI(systemPrompt, userPrompt, retries = 3) {
   try {
-    return await callGroq(systemPrompt, userPrompt, retries);
+    return await callGroqWithClient(groqPrimary, 'Groq#1', systemPrompt, userPrompt, retries);
   } catch (groqErr) {
     const msg = groqErr?.message || String(groqErr || '');
-    const shouldFallback = isGroqRateLimit(groqErr) || isGroqServer(groqErr) ||
-      msg.includes('tokens per day');
-    if (!shouldFallback) throw groqErr;
-    console.warn(`[AI] Groq falhou (${msg.slice(0, 80)}), tentando Gemini...`);
-    if (geminiClient) {
+    console.warn(`[AI] Groq chave 1 falhou (${msg.slice(0, 80)}), tentando chave 2...`);
+
+    if (groqFallback) {
       try {
-        const result = await callGemini(systemPrompt, userPrompt);
-        console.log('[AI] Gemini OK');
+        const result = await callGroqWithClient(groqFallback, 'Groq#2', systemPrompt, userPrompt, retries);
+        console.log('[AI] Groq chave 2 OK');
         return result;
-      } catch (geminiErr) {
-        console.error('[AI] Gemini falhou:', geminiErr?.message);
+      } catch (groq2Err) {
+        console.error('[AI] Groq chave 2 falhou:', groq2Err?.message);
       }
     }
-    try {
-      const result = await callOpenRouter(systemPrompt, userPrompt);
-      console.log('[AI] OpenRouter OK');
-      return result;
-    } catch (orErr) {
-      console.error('[AI] OpenRouter falhou:', orErr?.message);
-      throw groqErr;
+
+    if (anthropic) {
+      try {
+        const result = await callClaude(systemPrompt, userPrompt);
+        console.log('[AI] Claude OK');
+        return result;
+      } catch (claudeErr) {
+        console.error('[AI] Claude falhou:', claudeErr?.message);
+      }
     }
+
+    throw groqErr;
   }
 }
 
@@ -1504,10 +1487,10 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     groqConfigured: !!process.env.GROQ_API_KEY,
-    geminiConfigured: !!process.env.GEMINI_API_KEY,
-    openrouterConfigured: !!process.env.OPENROUTER_API_KEY,
+    groq2Configured: !!process.env.GROQ_API_KEY_2,
+    claudeConfigured: !!process.env.ANTHROPIC_API_KEY,
     model: MODEL,
-    geminiModel: GEMINI_MODEL
+    claudeModel: CLAUDE_MODEL
   });
 });
 
@@ -1523,8 +1506,8 @@ process.on('unhandledRejection', reason => console.error('💥 unhandledRejectio
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ Servidor rodando em http://localhost:${PORT}`);
-  console.log(`🔑 Groq: ${process.env.GROQ_API_KEY ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
-  console.log(`🔑 Gemini: ${process.env.GEMINI_API_KEY ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
-  console.log(`🔑 OpenRouter: ${process.env.OPENROUTER_API_KEY ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
-  console.log(`🤖 Modelo: ${MODEL} | Fallback: ${GEMINI_MODEL}`);
+  console.log(`🔑 Groq chave 1: ${process.env.GROQ_API_KEY ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
+  console.log(`🔑 Groq chave 2: ${process.env.GROQ_API_KEY_2 ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
+  console.log(`🔑 Claude: ${process.env.ANTHROPIC_API_KEY ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
+  console.log(`🤖 Cadeia: ${MODEL} (Groq#1 → Groq#2) → ${CLAUDE_MODEL} (Claude)`);
 });
