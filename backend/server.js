@@ -14,27 +14,6 @@ dotenv.config();
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const app = express();
-
-// TEMPORARIO: loga toda requisicao para identificar o que mantem o servico
-// acordado no Render (o free tier so hiberna apos 15 min sem trafego).
-// Remover depois de identificar a origem.
-app.use((req, res, next) => {
-  const t0 = Date.now();
-  const ip =
-    (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
-    req.socket.remoteAddress ||
-    '?';
-  const ua = (req.headers['user-agent'] || '-').slice(0, 120);
-  const ref = req.headers['referer'] || '-';
-  res.on('finish', () => {
-    console.log(
-      `[REQ] ${req.method} ${req.originalUrl} ${res.statusCode} ` +
-        `${Date.now() - t0}ms ip=${ip} ua="${ua}" ref="${ref}"`
-    );
-  });
-  next();
-});
-
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
