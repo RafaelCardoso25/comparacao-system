@@ -4,6 +4,7 @@ import multer from 'multer';
 import pdf from 'pdf-parse/lib/pdf-parse.js';
 import Groq from 'groq-sdk';
 import Anthropic from '@anthropic-ai/sdk';
+import { GoogleGenAI, ApiError as GeminiApiError } from '@google/genai';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
@@ -26,12 +27,25 @@ const upload = multer({
   }
 });
 
-// Groq principal (chave 1) e fallback (chave 2 gratuita)
-const groqPrimary = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// Gemini (principal): lê o PDF direto, inclusive escaneado. Se o primeiro
+// modelo estourar o limite gratuito ou não estiver disponível, tenta o segundo.
+const gemini = process.env.GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  : null;
+const GEMINI_MODELS = [
+  process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+  process.env.GEMINI_FALLBACK_MODEL || 'gemini-3.5-flash-lite'
+].filter((m, i, arr) => m && arr.indexOf(m) === i);
+
+// Groq (reserva): chave 1 e chave 2. O llama-3.3-70b-versatile foi desligado
+// pelo Groq em 16/08/2026; o substituto recomendado é o gpt-oss-120b.
+const groqPrimary = process.env.GROQ_API_KEY
+  ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  : null;
 const groqFallback = process.env.GROQ_API_KEY_2
   ? new Groq({ apiKey: process.env.GROQ_API_KEY_2 })
   : null;
-const MODEL = 'llama-3.3-70b-versatile';
+const MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -158,7 +172,7 @@ async function callClaude(systemPrompt, userPrompt) {
   if (!anthropic) throw new Error('Claude não configurado');
   const response = await anthropic.messages.create({
     model: CLAUDE_MODEL,
-    max_tokens: 4000,
+    max_tokens: 8000,
     system: systemPrompt,
     messages: [{ role: 'user', content: userPrompt }]
   });
@@ -177,7 +191,9 @@ async function callGroqWithClient(client, label, systemPrompt, userPrompt, retri
           { role: 'user', content: userPrompt }
         ],
         temperature: 0.05,
-        max_tokens: 4000
+        // o gpt-oss-120b raciocina antes de responder; o raciocínio conta no limite
+        max_tokens: 16000,
+        response_format: { type: 'json_object' }
       });
       const raw = response?.choices?.[0]?.message?.content?.trim();
       if (!raw) throw new Error(`Resposta vazia do ${label}`);
@@ -194,36 +210,83 @@ async function callGroqWithClient(client, label, systemPrompt, userPrompt, retri
   }
 }
 
-// Cadeia de fallback: Groq chave 1 → Groq chave 2 → Claude
-async function callAI(systemPrompt, userPrompt, retries = 3) {
-  try {
-    return await callGroqWithClient(groqPrimary, 'Groq#1', systemPrompt, userPrompt, retries);
-  } catch (groqErr) {
-    const msg = groqErr?.message || String(groqErr || '');
-    console.warn(`[AI] Groq chave 1 falhou (${msg.slice(0, 80)}), tentando chave 2...`);
-
-    if (groqFallback) {
-      try {
-        const result = await callGroqWithClient(groqFallback, 'Groq#2', systemPrompt, userPrompt, retries);
-        console.log('[AI] Groq chave 2 OK');
-        return result;
-      } catch (groq2Err) {
-        console.error('[AI] Groq chave 2 falhou:', groq2Err?.message);
-      }
-    }
-
-    if (anthropic) {
-      try {
-        const result = await callClaude(systemPrompt, userPrompt);
-        console.log('[AI] Claude OK');
-        return result;
-      } catch (claudeErr) {
-        console.error('[AI] Claude falhou:', claudeErr?.message);
-      }
-    }
-
-    throw groqErr;
+// Erros em que vale tentar o próximo modelo: limite gratuito (429), modelo
+// indisponível para a chave (403/404) ou instabilidade do Google (5xx)
+function isGeminiSkippable(err) {
+  if (err instanceof GeminiApiError) {
+    return [403, 404, 429].includes(err.status) || err.status >= 500;
   }
+  const msg = err?.message || String(err || '');
+  return msg.includes('fetch failed') || msg.includes('ECONNRESET');
+}
+
+// Chama o Gemini com os modelos de GEMINI_MODELS em ordem.
+// parts: conteúdo do usuário (texto e/ou PDF em inlineData).
+// schema: JSON Schema opcional para forçar o formato da resposta.
+async function callGemini(systemPrompt, parts, schema = null) {
+  if (!gemini) throw new Error('Gemini não configurado');
+  let lastErr;
+  for (const model of GEMINI_MODELS) {
+    try {
+      const response = await gemini.models.generateContent({
+        model,
+        contents: [{ role: 'user', parts }],
+        config: {
+          systemInstruction: systemPrompt,
+          temperature: 0,
+          maxOutputTokens: 32768,
+          responseMimeType: 'application/json',
+          ...(schema ? { responseJsonSchema: schema } : {})
+        }
+      });
+      const finish = response?.candidates?.[0]?.finishReason;
+      if (finish === 'MAX_TOKENS') {
+        console.warn(`[Gemini ${model}] resposta cortada no limite de tokens`);
+      }
+      const raw = response?.text?.trim();
+      if (!raw) throw new Error(`Resposta vazia do Gemini (${finish || 'sem motivo'})`);
+      return parseAIResponse(raw);
+    } catch (err) {
+      lastErr = err;
+      console.error(`[Gemini ${model}] falhou:`, err?.message?.slice(0, 200));
+      if (!isGeminiSkippable(err)) throw err;
+    }
+  }
+  throw lastErr;
+}
+
+// Cadeia de fallback para chamadas de texto (extração por texto e agrupamento):
+// Gemini → Groq chave 1 → Groq chave 2 → Claude (se configurado)
+async function callAI(systemPrompt, userPrompt, retries = 3) {
+  const attempts = [];
+  if (gemini) {
+    attempts.push(['Gemini', () => callGemini(systemPrompt, [{ text: userPrompt }])]);
+  }
+  if (groqPrimary) {
+    attempts.push(['Groq#1', () => callGroqWithClient(groqPrimary, 'Groq#1', systemPrompt, userPrompt, retries)]);
+  }
+  if (groqFallback) {
+    attempts.push(['Groq#2', () => callGroqWithClient(groqFallback, 'Groq#2', systemPrompt, userPrompt, retries)]);
+  }
+  if (anthropic) {
+    attempts.push(['Claude', () => callClaude(systemPrompt, userPrompt)]);
+  }
+  if (!attempts.length) {
+    throw new Error('Nenhuma IA configurada. Defina GEMINI_API_KEY ou GROQ_API_KEY no .env');
+  }
+
+  let firstErr;
+  for (const [label, run] of attempts) {
+    try {
+      const result = await run();
+      if (label !== attempts[0][0]) console.log(`[AI] ${label} OK`);
+      return result;
+    } catch (err) {
+      firstErr = firstErr || err;
+      console.warn(`[AI] ${label} falhou (${(err?.message || '').slice(0, 80)})`);
+    }
+  }
+  throw firstErr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,12 +450,14 @@ function cleanProductName(raw) {
     .replace(/^\d{4,8}\s+(?=[A-Z]{2})/i, '')
     // remove número sequencial de item (ex: "1 ANESTESICO")
     .replace(/^\d{1,3}\s+(?=[A-Z]{2})/i, '')
-    // remove razão social no final
-    .replace(/\s+(LTDA|S\/A|EIRELI|INDUSTRIA|COMERCIO|IMPORTA|BRASIL|DENTAL).+$/i, '')
+    // remove razão social no final (só a partir de LTDA/S.A/EIRELI — palavras
+    // como DENTAL ou BRASIL fazem parte do nome: "FIO DENTAL", "ESCOVA DENTAL")
+    .replace(/\s+(LTDA|S\/A|S\.A\.?|EIRELI)\b.*$/i, '')
     // remove unidade de medida isolada no final
     .replace(/\s+(UN|PC|CX|PCT|UND|UNID)\s*$/i, '')
-    // FIX 5: remove número isolado no final (ex: "ENHANCE CHAMA CX. 0")
-    .replace(/\s+\d{1,2}$/, '')
+    // remove quantidade zerada no final (ex: "ENHANCE CHAMA CX. 0"); outros
+    // números finais são tamanho/numeração ("LIMA K 25") e precisam ficar
+    .replace(/\s+0$/, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -723,6 +788,30 @@ function extractItemsFromStructuredText(text) {
 // EXTRAÇÃO VIA IA
 // ─────────────────────────────────────────────────────────────────────────────
 
+const AI_CHUNK_CHARS = 12000;
+const AI_CHUNK_OVERLAP_LINES = 6;
+
+// Divide o texto em blocos de linhas inteiras com no máximo maxChars cada.
+// Cada bloco repete as últimas linhas do anterior para não perder o item
+// que ficou na divisa; duplicatas exatas são removidas no sanitizeItems.
+function splitTextIntoChunks(text, maxChars) {
+  const lines = String(text || '').split('\n');
+  const chunks = [];
+  let current = [];
+  let currentLen = 0;
+  for (const line of lines) {
+    if (current.length && currentLen + line.length + 1 > maxChars) {
+      chunks.push(current.join('\n'));
+      current = current.slice(-AI_CHUNK_OVERLAP_LINES);
+      currentLen = current.reduce((sum, l) => sum + l.length + 1, 0);
+    }
+    current.push(line);
+    currentLen += line.length + 1;
+  }
+  if (current.length) chunks.push(current.join('\n'));
+  return chunks.length ? chunks : [''];
+}
+
 async function extractWithAI(text, cotacaoIndex, hints = {}) {
   console.log(`  → Chamando IA para extração (cotação ${cotacaoIndex + 1})...`);
 
@@ -752,17 +841,29 @@ Estrutura SEM colunas (sem |):
   - Se uma linha contém unidade de medida junto ao nome (ex: "FRASCO 250ML"), mantenha no nome
   - Ignore linhas que começam com "Lote:", CFOP (4 dígitos isolados), códigos auxiliares`;
 
-  const userPrompt = `Extraia TODOS os produtos desta cotação odontológica.${colHint}
+  // Cotações longas são divididas em partes para não cortar os itens finais
+  // (antes o texto era truncado em 18.000 caracteres e o resto se perdia)
+  const chunks = splitTextIntoChunks(text, AI_CHUNK_CHARS);
+  if (chunks.length > 1) {
+    console.log(`  → Texto dividido em ${chunks.length} partes para a IA`);
+  }
+
+  try {
+    const items = [];
+    for (let c = 0; c < chunks.length; c++) {
+      const partLabel = chunks.length > 1 ? ` (parte ${c + 1} de ${chunks.length})` : '';
+      const userPrompt = `Extraia TODOS os produtos deste trecho de cotação odontológica${partLabel}.${colHint}
 
 Se houver | no texto, cada | separa uma coluna.
 Se NÃO houver |, interprete linha a linha conforme as regras acima.
+Se o trecho começar no meio de um item, ignore o item incompleto do início.
 
-Cotação ${cotacaoIndex + 1}:
-${text.slice(0, 18000)}`;
-
-  try {
-    const result = await callAI(systemPrompt, userPrompt);
-    const items = Array.isArray(result?.items) ? result.items : [];
+Cotação ${cotacaoIndex + 1}${partLabel}:
+${chunks[c]}`;
+      const result = await callAI(systemPrompt, userPrompt);
+      if (Array.isArray(result?.items)) items.push(...result.items);
+      if (c < chunks.length - 1) await sleep(1000);
+    }
     const fixed = items.map(item => {
       const name = cleanProductName(safeString(item?.name));
       const qty  = parseBrazilianNumber(item?.qty) || 1;
@@ -817,10 +918,105 @@ function sanitizeItems(items) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// EXTRAÇÃO VIA GEMINI LENDO O PDF DIRETO
+// ─────────────────────────────────────────────────────────────────────────────
+
+const GEMINI_ITEMS_SCHEMA = {
+  type: 'object',
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Descrição completa do produto, como escrita na cotação' },
+          qty: { type: 'number', description: 'Quantidade cotada' },
+          unitPrice: { type: 'number', description: 'Preço unitário em reais' },
+          totalPrice: { type: 'number', description: 'Valor total do item em reais (quantidade × unitário)' }
+        },
+        required: ['name', 'qty', 'totalPrice']
+      }
+    }
+  },
+  required: ['items']
+};
+
+// O Gemini lê o PDF como documento (texto + layout + imagem da página), então
+// funciona com PDF escaneado e não depende da montagem de colunas com "|"
+async function extractWithGeminiPDF(fileBuffer, cotacaoIndex, hints = {}) {
+  console.log(`  → Enviando PDF para o Gemini (cotação ${cotacaoIndex + 1})...`);
+
+  const colInstructions = [];
+  if (hints.produto)    colInstructions.push(`- A coluna de produto se chama "${hints.produto}"`);
+  if (hints.quantidade) colInstructions.push(`- A coluna de quantidade se chama "${hints.quantidade}"`);
+  if (hints.preco)      colInstructions.push(`- A coluna de preço total se chama "${hints.preco}"`);
+  const colHint = colInstructions.length
+    ? `\n\nInformações do usuário sobre as colunas:\n${colInstructions.join('\n')}`
+    : '';
+
+  const systemPrompt = `Você extrai a lista de itens de cotações de fornecedores de materiais odontológicos em PDF.
+
+Regras:
+- Extraia TODOS os itens cotados, de todas as páginas, na ordem em que aparecem.
+- name: copie a descrição do produto exatamente como está escrita, incluindo marca, modelo, cor/tonalidade, tamanho, numeração, medida e apresentação (ex: "RESINA Z350 XT A2 4G 3M", "LIMA K 25 21MM", "LUVA PROCEDIMENTO M CX C/100"). Não traduza, não abrevie, não corrija e não invente palavras. Se a descrição continuar na linha de baixo, junte as duas partes.
+- Não inclua no name: o número do item, o código interno do produto, NCM, CFOP ou lote.
+- qty: quantidade cotada do item. Em formatos como "3,000" ou "60,000", o valor é 3 e 60.
+- unitPrice e totalPrice: valores em reais como número (ex: "1.234,56" → 1234.56). totalPrice é o valor total da linha.
+- Ignore: totais gerais, subtotais, frete, impostos (ICMS, ST, IPI), descontos gerais, condições de pagamento, cabeçalhos, rodapés e observações.
+- Se um item estiver sem preço (fornecedor não cotou), não o inclua.`;
+
+  const result = await callGemini(systemPrompt, [
+    { inlineData: { mimeType: 'application/pdf', data: fileBuffer.toString('base64') } },
+    { text: `Extraia todos os itens desta cotação.${colHint}` }
+  ], GEMINI_ITEMS_SCHEMA);
+
+  const items = Array.isArray(result?.items) ? result.items : [];
+  const fixed = items.map(item => {
+    const name = cleanProductName(safeString(item?.name));
+    const qty = parseBrazilianNumber(item?.qty) || 1;
+    let totalPrice = parseBrazilianNumber(item?.totalPrice);
+    const unitPrice = parseBrazilianNumber(item?.unitPrice);
+    if ((!totalPrice || totalPrice <= 0) && unitPrice > 0) totalPrice = unitPrice * qty;
+    if (!name || name.length < 3 || !totalPrice || totalPrice <= 0) return null;
+    return { name, qty: Math.round(qty), totalPrice: roundMoney(totalPrice) };
+  }).filter(Boolean);
+
+  console.log(`  → Gemini extraiu ${fixed.length} itens`);
+  return fixed;
+}
+
+// Junta a extração local com a da IA sem duplicar o mesmo item escrito de
+// formas diferentes (ex: "RESINA Z350 A2" local e "RESINA Z350 XT A2" na IA).
+// A IA é a base; um item local só entra se nenhum item da IA for ele mesmo.
+function mergeLocalAndAIItems(localItems, aiItems) {
+  if (!aiItems.length) return localItems;
+  const extras = localItems.filter(local => !aiItems.some(ai => {
+    const sameMoney = Math.abs(ai.totalPrice - local.totalPrice) <= 0.01 * Math.max(ai.totalPrice, local.totalPrice);
+    const score = similarityScore(local.name, ai.name);
+    return score >= 0.85 || (sameMoney && score >= 0.5);
+  }));
+  return sanitizeItems([...aiItems, ...extras]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PIPELINE PRINCIPAL DE EXTRAÇÃO
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function extractItemsFromPDF(fileBuffer, cotacaoIndex, columnHints = {}) {
+  // 0. Caminho principal: Gemini lê o PDF direto. Se falhar ou não achar
+  //    nada, segue o caminho antigo (texto + extração local + IA de texto).
+  if (gemini) {
+    try {
+      const geminiItems = sanitizeItems(
+        await extractWithGeminiPDF(fileBuffer, cotacaoIndex, columnHints)
+      );
+      if (geminiItems.length > 0) return { items: geminiItems, method: 'gemini-pdf' };
+      console.warn('  → Gemini não encontrou itens, tentando extração por texto...');
+    } catch (err) {
+      console.warn('  → Gemini falhou no PDF, tentando extração por texto:', err?.message?.slice(0, 120));
+    }
+  }
+
   // 1. Extrai texto com pdfjs
   let text = await extractTextWithPdfjs(fileBuffer);
 
@@ -830,10 +1026,18 @@ async function extractItemsFromPDF(fileBuffer, cotacaoIndex, columnHints = {}) {
     text = await extractTextFallback(fileBuffer);
   }
 
+  // PDF sem texto (escaneado/imagem): só o Gemini consegue ler. Se chegou
+  // aqui, ele não está configurado ou falhou; mandar texto vazio para a IA
+  // de texto fazia ela inventar itens ou não devolver nada
   if (!text || text.length < 150) {
-    console.warn('  → Texto insuficiente, indo para IA...');
-    const aiItems = await extractWithAI('', cotacaoIndex, columnHints);
-    return { items: sanitizeItems(aiItems), method: 'ai-only' };
+    console.warn('  → PDF sem texto selecionável (provavelmente escaneado)');
+    throw new Error(
+      gemini
+        ? 'Este PDF parece ser escaneado e o Gemini não conseguiu lê-lo agora ' +
+          '(limite gratuito ou instabilidade). Tente de novo em alguns minutos.'
+        : 'Este PDF parece ser escaneado (imagem). Configure a GEMINI_API_KEY ' +
+          'para ler PDFs escaneados, ou peça ao fornecedor o PDF original.'
+    );
   }
 
   console.log(`  → Primeiras linhas:\n${text.split('\n').slice(0, 10).join('\n')}\n  ...`);
@@ -905,7 +1109,7 @@ async function extractItemsFromPDF(fileBuffer, cotacaoIndex, columnHints = {}) {
   );
   const aiItems = await extractWithAI(text, cotacaoIndex, columnHints);
   const sanitizedAI = sanitizeItems(aiItems);
-  const combined = sanitizeItems([...sanitizedLocal, ...sanitizedAI]);
+  const combined = mergeLocalAndAIItems(sanitizedLocal, sanitizedAI);
 
   console.log(
     `  → Final: ${combined.length} itens (local: ${sanitizedLocal.length} + IA: ${sanitizedAI.length})`
@@ -923,10 +1127,7 @@ async function extractItemsFromPDF(fileBuffer, cotacaoIndex, columnHints = {}) {
 function applyDomainAliases(value) {
   return value
     .replace(/\bROLO\b/g, 'BOBINA')
-    .replace(/\bESTERILIZACAO\b/g, 'SELADORA')
     .replace(/\bTEMPORARIO\b/g, 'PROVISORIO')
-    .replace(/\bRESTAURADOR\b/g, 'CIMENTO')
-    .replace(/\bOBTURADOR\b/g, 'CIMENTO')
     .replace(/\bSOF\.LEX\b/g, 'SOFLEX')
     .replace(/\bSOF-LEX\b/g, 'SOFLEX')
     .replace(/\bZ-350\b/g, 'Z350')
@@ -979,7 +1180,7 @@ function tokenizeName(name) {
 }
 
 function isMeasureToken(token) {
-  return /^(\d+(?:[.,]\d+)?)(MG|G|KG|ML|L|MCG|UI|MM|CM|%)$/.test(token);
+  return /^(\d+(?:[.,]\d+)?)(MG|G|KG|ML|L|MCG|UI|MM|CM|M|%)$/.test(token);
 }
 
 function getStrongCommercialTokens(name) {
@@ -998,6 +1199,17 @@ function getCriticalTokens(name) {
 }
 
 function hasCriticalConflict(nameA, nameB) {
+  // Números soltos diferentes indicam tamanho/numeração diferente ("LIMA K 25" x "LIMA K 30")
+  const numbersA = tokenizeName(nameA).filter(t => /^\d+$/.test(t));
+  const numbersB = tokenizeName(nameB).filter(t => /^\d+$/.test(t));
+  if (numbersA.length > 0 && numbersB.length > 0 &&
+      !numbersA.some(n => numbersB.includes(n))) return true;
+  // Tamanhos diferentes (luva P x M) também são produtos diferentes
+  const SIZES = ["PP", "P", "M", "G", "GG", "XG", "XGG"];
+  const sizesA = tokenizeName(nameA).filter(t => SIZES.includes(t));
+  const sizesB = tokenizeName(nameB).filter(t => SIZES.includes(t));
+  if (sizesA.length > 0 && sizesB.length > 0 &&
+      !sizesA.some(t => sizesB.includes(t))) return true;
   const criticalA = getCriticalTokens(nameA);
   const criticalB = getCriticalTokens(nameB);
   if (criticalA.length === 0 || criticalB.length === 0) return false;
@@ -1178,45 +1390,41 @@ function buildGroupsLocally(items, numCotacoes) {
   return redistributeOverflow(finalGroups, overflow, numCotacoes);
 }
 
+const AI_PAIRS_PER_CALL = 50;
+const AI_MAX_PAIRS = 400;
+
+// Pergunta à IA, em lotes, quais pares de grupos são o mesmo produto.
+// Retorna os pares aprovados como [idxA, idxB] (índices de candidateGroups).
+// Antes só os 60 primeiros grupos eram analisados e a IA precisava cruzar
+// duas listas de índices; agora cada par tem um número próprio.
 async function resolveAmbiguousPairsWithAI(candidateGroups, pairs) {
   if (!pairs.length) return [];
-  const limitedGroups = candidateGroups.slice(0, 60);
-  const valid = new Set(limitedGroups.map(g => g.localIdx));
-  const filteredPairs = pairs.filter(([a, b]) => valid.has(a) && valid.has(b));
-  if (!filteredPairs.length) return [];
+  const limitedPairs = pairs.slice(0, AI_MAX_PAIRS);
 
-  const pairLines = filteredPairs.map(([a, b]) => {
-    const ga = limitedGroups.find(g => g.localIdx === a);
-    const gb = limitedGroups.find(g => g.localIdx === b);
-    if (!ga || !gb) return null;
-    return (
-      `[${limitedGroups.indexOf(ga)},${limitedGroups.indexOf(gb)}]` +
-      ` "${ga.name}" vs "${gb.name}"`
+  const systemPrompt = `Você é especialista em materiais odontológicos e compara itens de cotações de fornecedores diferentes.
+Para cada par numerado, decida se as duas descrições são o MESMO produto (mesmo item que poderia ser comprado de qualquer um dos dois fornecedores).
+Considere abreviações e grafias diferentes como iguais (ex: "CX" = "CAIXA", "RES." = "RESINA", "Z-350" = "Z350").
+NÃO é o mesmo produto se mudar: tamanho, numeração, cor/tonalidade, dosagem, concentração, volume, quantidade por embalagem, ou marca (quando os dois informam marcas diferentes).
+Na dúvida, responda que NÃO é o mesmo.
+Responda SOMENTE JSON válido no formato {"same":[0,3]} com os números dos pares que são o mesmo produto, ou {"same":[]}.`;
+
+  const approved = [];
+  for (let start = 0; start < limitedPairs.length; start += AI_PAIRS_PER_CALL) {
+    const batch = limitedPairs.slice(start, start + AI_PAIRS_PER_CALL);
+    const pairLines = batch.map(([a, b], i) =>
+      `${i}: "${candidateGroups[a].name}" | "${candidateGroups[b].name}"`
     );
-  }).filter(Boolean);
+    const userPrompt = `Pares:\n${pairLines.join('\n')}`;
 
-  if (!pairLines.length) return [];
-
-  const systemPrompt = `Você é especialista em materiais odontológicos.
-Decida se pares de descrições representam o MESMO produto.
-Responda SOMENTE JSON válido: {"merge":[[0,1],[2,3]]}`;
-
-  const userPrompt = `Analise os pares e agrupe os que são o mesmo produto.
-NÃO agrupe se houver diferença de dosagem, concentração, volume ou tamanho.
-
-Pares:
-${pairLines.join('\n')}
-
-Produtos:
-${limitedGroups.map((g, i) => `${i}: "${g.name}"`).join('\n')}
-
-Responda: {"merge":[[0,1]]} ou {"merge":[]}`;
-
-  const result = await callAI(systemPrompt, userPrompt);
-  const merges = Array.isArray(result?.merge) ? result.merge : [];
-  return merges
-    .map(group => group.map(i => limitedGroups[i]?.localIdx).filter(x => x !== undefined))
-    .filter(group => group.length >= 2);
+    const result = await callAI(systemPrompt, userPrompt);
+    const same = Array.isArray(result?.same) ? result.same : [];
+    for (const n of same) {
+      const pair = batch[Number(n)];
+      if (pair) approved.push(pair);
+    }
+    if (start + AI_PAIRS_PER_CALL < limitedPairs.length) await sleep(1000);
+  }
+  return approved;
 }
 
 async function groupItemsRich(items, numCotacoes) {
@@ -1245,34 +1453,54 @@ async function groupItemsRich(items, numCotacoes) {
     name: chooseCanonicalName(group)
   }));
 
+  // Pares candidatos: nomes parecidos, sem conflito de medida/código e sem
+  // fornecedor em comum (dois itens do mesmo fornecedor não são o mesmo produto)
   const ambiguousPairs = [];
   for (let i = 0; i < candidateGroups.length; i++) {
+    const cotacoesI = new Set(candidateGroups[i].items.map(it => it.cotacaoIdx));
     for (let j = i + 1; j < candidateGroups.length; j++) {
+      if (candidateGroups[j].items.some(it => cotacoesI.has(it.cotacaoIdx))) continue;
       const score = similarityScore(candidateGroups[i].name, candidateGroups[j].name);
       if (!hasCriticalConflict(candidateGroups[i].name, candidateGroups[j].name) &&
           score >= 0.24) {
-        ambiguousPairs.push([i, j]);
+        ambiguousPairs.push({ pair: [i, j], score });
       }
     }
   }
+  ambiguousPairs.sort((a, b) => b.score - a.score);
 
   let mergedLocalGroups = candidateGroups.map(g => ({ items: [...g.items], name: g.name }));
 
   try {
-    const aiMerges = await resolveAmbiguousPairsWithAI(candidateGroups, ambiguousPairs);
-    const merged = new Set();
-    for (const mergeGroup of aiMerges) {
-      if (mergeGroup.length < 2) continue;
-      const [first, ...rest] = mergeGroup;
-      if (merged.has(first)) continue;
-      for (const other of rest) {
-        if (merged.has(other) || other === first) continue;
-        mergedLocalGroups[first].items.push(...mergedLocalGroups[other].items);
-        mergedLocalGroups[first].name = chooseCanonicalName(mergedLocalGroups[first].items);
-        merged.add(other);
-      }
+    const approvedPairs = await resolveAmbiguousPairsWithAI(
+      candidateGroups,
+      ambiguousPairs.map(p => p.pair)
+    );
+
+    // Union-find: junta os pares aprovados, inclusive de forma transitiva,
+    // sem deixar dois itens do mesmo fornecedor no mesmo grupo
+    const parent = candidateGroups.map((_, i) => i);
+    const find = (x) => (parent[x] === x ? x : (parent[x] = find(parent[x])));
+    const cotacoesOf = candidateGroups.map(g => new Set(g.items.map(it => it.cotacaoIdx)));
+    for (const [a, b] of approvedPairs) {
+      const ra = find(a), rb = find(b);
+      if (ra === rb) continue;
+      if ([...cotacoesOf[rb]].some(c => cotacoesOf[ra].has(c))) continue;
+      parent[rb] = ra;
+      cotacoesOf[rb].forEach(c => cotacoesOf[ra].add(c));
     }
-    mergedLocalGroups = mergedLocalGroups.filter((_, idx) => !merged.has(idx));
+
+    const byRoot = new Map();
+    candidateGroups.forEach((g, i) => {
+      const root = find(i);
+      if (!byRoot.has(root)) byRoot.set(root, []);
+      byRoot.get(root).push(...g.items);
+    });
+    mergedLocalGroups = [...byRoot.values()].map(groupItems => ({
+      items: groupItems,
+      name: chooseCanonicalName(groupItems)
+    }));
+    console.log(`[Agrupamento] IA aprovou ${approvedPairs.length} de ${ambiguousPairs.length} pares`);
   } catch (err) {
     console.warn('[Agrupamento] IA falhou, mantendo local:', err.message);
   }
@@ -1353,10 +1581,11 @@ app.post('/api/extract-pdfs', upload.array('pdfs', 10), async (req, res) => {
         });
       }
 
-      // Sleep entre arquivos se usou IA e não é o último
+      // Pausa entre arquivos quando usou IA, para respeitar o limite por
+      // minuto do plano gratuito
       if (i < req.files.length - 1) {
-        const usedAI = results[results.length - 1]?.method?.includes('ai');
-        if (usedAI) await sleep(2000);
+        const method = results[results.length - 1]?.method || '';
+        if (method.includes('ai') || method.includes('gemini')) await sleep(2000);
       }
     }
 
@@ -1486,6 +1715,8 @@ app.delete('/api/history', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
+    geminiConfigured: !!process.env.GEMINI_API_KEY,
+    geminiModels: GEMINI_MODELS,
     groqConfigured: !!process.env.GROQ_API_KEY,
     groq2Configured: !!process.env.GROQ_API_KEY_2,
     claudeConfigured: !!process.env.ANTHROPIC_API_KEY,
@@ -1506,8 +1737,9 @@ process.on('unhandledRejection', reason => console.error('💥 unhandledRejectio
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ Servidor rodando em http://localhost:${PORT}`);
+  console.log(`🔑 Gemini: ${process.env.GEMINI_API_KEY ? 'OK' : '⚠️ NÃO CONFIGURADO'} (${GEMINI_MODELS.join(' → ')})`);
   console.log(`🔑 Groq chave 1: ${process.env.GROQ_API_KEY ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
   console.log(`🔑 Groq chave 2: ${process.env.GROQ_API_KEY_2 ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
   console.log(`🔑 Claude: ${process.env.ANTHROPIC_API_KEY ? 'OK' : '⚠️ NÃO CONFIGURADO'}`);
-  console.log(`🤖 Cadeia: ${MODEL} (Groq#1 → Groq#2) → ${CLAUDE_MODEL} (Claude)`);
+  console.log(`🤖 Cadeia: Gemini (PDF direto) → ${MODEL} (Groq#1 → Groq#2) → ${CLAUDE_MODEL} (Claude)`);
 });

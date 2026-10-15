@@ -57,10 +57,7 @@ function normalizeMeasures(value) {
 function applyDomainAliases(value) {
   return value
     .replace(/\bROLO\b/g, 'BOBINA')
-    .replace(/\bESTERILIZACAO\b/g, 'SELADORA')
     .replace(/\bTEMPORARIO\b/g, 'PROVISORIO')
-    .replace(/\bRESTAURADOR\b/g, 'CIMENTO')
-    .replace(/\bOBTURADOR\b/g, 'CIMENTO')
     .replace(/\bSOF\.LEX\b/g, 'SOFLEX')
     .replace(/\bSOF-LEX\b/g, 'SOFLEX')
     .replace(/\bZ-350\b/g, 'Z350')
@@ -89,7 +86,7 @@ function tokenize(value) {
 }
 
 function isNumericMeasureToken(token) {
-  return /^(\d+(?:[.,]\d+)?)(MG|G|KG|ML|L|MCG|UI|MM|CM|%)$/.test(token);
+  return /^(\d+(?:[.,]\d+)?)(MG|G|KG|ML|L|MCG|UI|MM|CM|M|%)$/.test(token);
 }
 
 function isRelevantToken(token) {
@@ -132,6 +129,17 @@ function getCriticalTokens(name) {
 }
 
 function hasCriticalConflict(nameA, nameB) {
+  // Números soltos diferentes indicam tamanho/numeração diferente ("LIMA K 25" x "LIMA K 30")
+  const numbersA = tokenize(normalizeProductName(nameA)).filter(t => /^\d+$/.test(t));
+  const numbersB = tokenize(normalizeProductName(nameB)).filter(t => /^\d+$/.test(t));
+  if (numbersA.length > 0 && numbersB.length > 0 &&
+      !numbersA.some(n => numbersB.includes(n))) return true;
+  // Tamanhos diferentes (luva P x M) também são produtos diferentes
+  const SIZES = ["PP", "P", "M", "G", "GG", "XG", "XGG"];
+  const sizesA = tokenize(normalizeProductName(nameA)).filter(t => SIZES.includes(t));
+  const sizesB = tokenize(normalizeProductName(nameB)).filter(t => SIZES.includes(t));
+  if (sizesA.length > 0 && sizesB.length > 0 &&
+      !sizesA.some(t => sizesB.includes(t))) return true;
   const criticalA = getCriticalTokens(nameA);
   const criticalB = getCriticalTokens(nameB);
   if (criticalA.length === 0 || criticalB.length === 0) return false;
