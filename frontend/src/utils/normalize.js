@@ -19,9 +19,12 @@ function normalizeBaseText(value) {
 function replaceCommonAbbreviations(value) {
   return value
     .replace(/\bCX\b/g, 'CAIXA')
-    .replace(/\bC\/\b/g, 'COM')
-    .replace(/\bS\/\b/g, 'SEM')
-    .replace(/\bP\/\b/g, 'PARA')
+    // "C/6" → "COM 6" e "S/VASO" → "SEM VASO" (antes virava "COM6"/"SEMVASO")
+    .replace(/\bC\/\s*/g, 'COM ')
+    .replace(/\bS\/\s*/g, 'SEM ')
+    .replace(/\bP\/\s*/g, 'PARA ')
+    // "N.25", "Nº 25", "NO 25" → "25" (numeração de lima, agulha etc.)
+    .replace(/\bN(?:O|º|°)?\.?\s*(?=\d)/g, ' ')
     .replace(/\bUND\b/g, 'UNIDADE')
     .replace(/\bUNID\b/g, 'UNIDADE')
     .replace(/\bUN\b/g, 'UNIDADE')
@@ -132,8 +135,9 @@ function hasCriticalConflict(nameA, nameB) {
   // Números soltos diferentes indicam tamanho/numeração diferente ("LIMA K 25" x "LIMA K 30")
   const numbersA = tokenize(normalizeProductName(nameA)).filter(t => /^\d+$/.test(t));
   const numbersB = tokenize(normalizeProductName(nameB)).filter(t => /^\d+$/.test(t));
-  if (numbersA.length > 0 && numbersB.length > 0 &&
-      !numbersA.some(n => numbersB.includes(n))) return true;
+  // (conflito quando cada lado tem um número que o outro não tem — "K 25 CX 6" x "K 30 CX 6")
+  if (numbersA.some(n => !numbersB.includes(n)) &&
+      numbersB.some(n => !numbersA.includes(n))) return true;
   // Tamanhos diferentes (luva P x M) também são produtos diferentes
   const SIZES = ["PP", "P", "M", "G", "GG", "XG", "XGG"];
   const sizesA = tokenize(normalizeProductName(nameA)).filter(t => SIZES.includes(t));
